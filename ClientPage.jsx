@@ -2,11 +2,35 @@ import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 /* ─── SUPABASE CLIENT ────────────────────────────────────── */
-const supabase = createClient(
-  import.meta.env.VITE_SUPABASE_URL  || "",
-  import.meta.env.VITE_SUPABASE_ANON_KEY || ""
-);
+const SUPABASE_URL  = import.meta.env.VITE_SUPABASE_URL  || "https://dzoydnwiojlhlkibdjwu.supabase.co";
+const SUPABASE_KEY  = import.meta.env.VITE_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR6b3lkbndpb2psaGxraWJkand1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgxNDA2MTMsImV4cCI6MjA5MzcxNjYxM30.1vsuDWQoyPBHIFcEUDswVNF12hBDrAJZU8Dfq5OFoHM";
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const CLIENT_ID = import.meta.env.VITE_CLIENT_ID || "default";
+
+/* ─── SESSION / ANALYTICS HELPERS ───────────────────────── */
+function getSessionId() {
+  let id = sessionStorage.getItem("cp:sid");
+  if (!id) { id = Date.now().toString(36) + Math.random().toString(36).slice(2); sessionStorage.setItem("cp:sid", id); }
+  return id;
+}
+function parseUA(ua = navigator.userAgent) {
+  const browser =
+    /Edg\//.test(ua)     ? "Edge"    :
+    /OPR\//.test(ua)     ? "Opera"   :
+    /Chrome\//.test(ua)  ? "Chrome"  :
+    /Firefox\//.test(ua) ? "Firefox" :
+    /Safari\//.test(ua)  ? "Safari"  : "Unknown";
+  const os =
+    /Windows/.test(ua)        ? "Windows" :
+    /iPhone|iPad/.test(ua)    ? "iOS"     :
+    /Mac OS X/.test(ua)       ? "Mac"     :
+    /Android/.test(ua)        ? "Android" :
+    /Linux/.test(ua)          ? "Linux"   : "Unknown";
+  const device = /Mobi|Android/i.test(ua) ? "📱 Мобильный" : "🖥 Компьютер";
+  return { browser, os, device };
+}
+const SESSION_ID = getSessionId();
+const { browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE } = parseUA();
 
 /* ─── HELPERS ───────────────────────────────────────────── */
 const MONTHS_RU = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
@@ -114,6 +138,14 @@ export default function App() {
   const [activeTimer, setActiveTimer] = useState(null);
   const [timerElapsed, setTimerElapsed] = useState(0);
 
+  // Realtime / presence / analytics
+  const [onlineUsers,  setOnlineUsers]  = useState([]);
+  const [visits,       setVisits]       = useState([]);
+  const [geoData,      setGeoData]      = useState(null);
+  const [showOnline,   setShowOnline]   = useState(false);
+  const lastSavedRef       = useRef(null);
+  const presenceChannelRef = useRef(null);
+
   // Supabase sync state
   const [loaded,     setLoaded]     = useState(false);
   const [syncStatus, setSyncStatus] = useState("idle"); // idle | saving | saved | error
@@ -123,6 +155,80 @@ export default function App() {
   const tasksRef       = useRef(tasks);
   useEffect(() => { activeTimerRef.current = activeTimer; }, [activeTimer]);
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+
+  /* ── Geo fetch ── */
+  useEffect(() => {
+    fetch("https://ip-api.com/json?fields=status,country,city,query")
+      .then(r => r.json()).then(d => { if (d.status === "success") setGeoData(d); }).catch(() => {});
+  }, []);
+
+  /* ── Realtime data sync ── */
+  useEffect(() => {
+    const ch = supabase.channel(`data:${CLIENT_ID}`)
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "client_data", filter: `client_id=eq.${CLIENT_ID}` },
+        (payload) => {
+          if (payload.new.updated_at === lastSavedRef.current) return; // own update
+          const d = payload.new;
+          if (d.client_name) setClientName(d.client_name);
+          if (d.rows)        setRows(d.rows);
+          if (d.payments)    setPayments(d.payments);
+          if (d.knowledge)   setKnowledge(d.knowledge);
+          if (d.tasks)       setTasks(d.tasks);
+        })
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, []);
+
+  /* ── Presence (online users) ── */
+  useEffect(() => {
+    const ch = supabase.channel(`presence:${CLIENT_ID}`, { config: { presence: { key: SESSION_ID } } });
+    presenceChannelRef.current = ch;
+    ch.on("presence", { event: "sync" }, () => {
+        setOnlineUsers(Object.values(ch.presenceState()).flat());
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          await ch.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, joinedAt: new Date().toISOString() });
+        }
+      });
+    return () => supabase.removeChannel(ch);
+  }, []);
+
+  /* ── Update presence with geo when loaded ── */
+  useEffect(() => {
+    if (!geoData || !presenceChannelRef.current) return;
+    presenceChannelRef.current.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, city: geoData.city, country: geoData.country, ip: geoData.query, joinedAt: new Date().toISOString() });
+  }, [geoData]);
+
+  /* ── Log visit ── */
+  useEffect(() => {
+    if (!loaded) return;
+    const logVisit = () => supabase.from("visits").upsert({
+      session_id: SESSION_ID, client_id: CLIENT_ID,
+      browser: MY_BROWSER, os: MY_OS,
+      ip: geoData?.query || null, country: geoData?.country || null, city: geoData?.city || null,
+      last_seen: new Date().toISOString(),
+    }, { onConflict: "session_id" });
+    logVisit();
+    const iv = setInterval(logVisit, 30000); // обновляем last_seen каждые 30 сек
+    return () => clearInterval(iv);
+  }, [loaded, geoData]);
+
+  /* ── Load visits history ── */
+  useEffect(() => {
+    if (!loaded) return;
+    supabase.from("visits").select("*").eq("client_id", CLIENT_ID).order("last_seen", { ascending: false }).limit(200)
+      .then(({ data }) => { if (data) setVisits(data); });
+    // Realtime для новых визитов
+    const ch = supabase.channel(`visits:${CLIENT_ID}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "visits", filter: `client_id=eq.${CLIENT_ID}` },
+        () => {
+          supabase.from("visits").select("*").eq("client_id", CLIENT_ID).order("last_seen", { ascending: false }).limit(200)
+            .then(({ data }) => { if (data) setVisits(data); });
+        })
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, [loaded]);
 
   /* ── Load from Supabase on mount ── */
   useEffect(() => {
@@ -145,11 +251,13 @@ export default function App() {
     setSyncStatus("saving");
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(async () => {
+      const now = new Date().toISOString();
       const { error } = await supabase.from("client_data").upsert({
         client_id: CLIENT_ID, client_name: clientName,
         rows, payments, knowledge, tasks,
-        updated_at: new Date().toISOString(),
+        updated_at: now,
       });
+      lastSavedRef.current = now;
       if (error) { setSyncStatus("error"); }
       else { setSyncStatus("saved"); setTimeout(() => setSyncStatus("idle"), 2500); }
     }, 800);
@@ -210,12 +318,24 @@ export default function App() {
   const addTask = (afterIdx) => {
     const nt = { id: mkId(), name: "", status: "new", result: "", planTime: "", notBillable: false, createdAt: new Date().toISOString(), sessions: [] };
     setTasks(prev => { const n = [...prev]; n.splice((afterIdx ?? n.length) + 1, 0, nt); return n; });
+    setTimeout(() => {
+      const rows = document.querySelectorAll("[data-task-row]");
+      const last = rows[rows.length - 1];
+      if (last) { const inp = last.querySelector("input:not([type=checkbox])"); inp?.focus(); }
+    }, 30);
   };
   const updTask = (id, f, v) => setTasks(prev => prev.map(t => t.id === id ? { ...t, [f]: v } : t));
   const rmTask  = (id) => { if (activeTimerRef.current?.taskId === id) stopTimerRef.current(); setTasks(prev => prev.filter(t => t.id !== id)); };
 
   /* ── Rows CRUD ── */
-  const addRow     = (ai) => setRows(prev => { const n = [...prev]; n.splice(ai + 1, 0, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: false }); return n; });
+  const addRow = (ai) => {
+    setRows(prev => { const n = [...prev]; n.splice(ai + 1, 0, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: false }); return n; });
+    setTimeout(() => {
+      const rows = document.querySelectorAll("[data-time-row]");
+      const last = rows[rows.length - 1];
+      if (last) { const inp = last.querySelector("input"); inp?.focus(); }
+    }, 30);
+  };
   const addDivider = () => setRows(r => [...r, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: true, label: "" }]);
   const updRow     = (id, f, v) => setRows(r => r.map(x => x.id === id ? { ...x, [f]: v } : x));
   const rmRow      = (id) => setRows(r => r.filter(x => x.id !== id));
@@ -310,8 +430,20 @@ export default function App() {
           );
         })()}
 
+        {/* Online indicator */}
+        <div style={{ position: "relative", flexShrink: 0 }}>
+          <button onClick={() => setShowOnline(p => !p)}
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(255,255,255,.07)", border: "1px solid rgba(255,255,255,.12)", borderRadius: 8, padding: "4px 12px", cursor: "pointer", fontFamily: "inherit" }}>
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: onlineUsers.length > 0 ? "#4ADE80" : "#6B7280", flexShrink: 0 }} />
+            <span style={{ fontSize: 12, color: onlineUsers.length > 0 ? "#4ADE80" : "#6B7280", fontWeight: 600 }}>
+              {onlineUsers.length} онлайн
+            </span>
+          </button>
+          {showOnline && <OnlinePanel users={onlineUsers} onClose={() => setShowOnline(false)} />}
+        </div>
+
         <nav style={{ marginLeft: "auto", display: "flex", gap: 2 }}>
-          {[["tasks","✅ Задачи"],["time","⏱ Время"],["payments","💳 Оплаты"],["kb","📚 База знаний"]].map(([k, l]) => (
+          {[["tasks","✅ Задачи"],["time","⏱ Время"],["payments","💳 Оплаты"],["kb","📚 База знаний"],["visits","👁 Посещения"]].map(([k, l]) => (
             <button key={k} onClick={() => setTab(k)} style={{ background: tab === k ? "rgba(200,146,42,.15)" : "none", border: `1px solid ${tab === k ? "rgba(200,146,42,.6)" : "transparent"}`, color: tab === k ? C.gold : "#9CA3AF", borderRadius: 7, padding: "5px 14px", cursor: "pointer", fontSize: 13, fontWeight: 500, fontFamily: "inherit" }}>{l}</button>
           ))}
         </nav>
@@ -319,12 +451,12 @@ export default function App() {
 
       {/* Summary bar */}
       <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: "10px 20px", display: "flex", gap: 24, alignItems: "center", flexWrap: "wrap" }}>
-        <SumCard label="Відпрацьовано, год" value={totalWorkMin > 0 ? (totalWorkMin / 60).toFixed(2) : "—"} color={C.dark} />
-        <SumCard label="До рахунку, год"    value={billableMin > 0 ? (billableMin / 60).toFixed(2) : "—"} color={C.success} />
-        <SumCard label="Оплачено, год"      value={totalPaidHours > 0 ? totalPaidHours.toFixed(2) : "—"} color={C.blue} />
-        <SumCard label="Різниця (рах.), год" value={billableMin > 0 || totalPaidHours > 0 ? (diffHours >= 0 ? "+" : "") + diffHours.toFixed(2) : "—"} color={diffHours < -0.01 ? C.danger : C.success} />
-        <SumCard label="Оплачено, ₴"        value={totalPaidSum > 0 ? fmtMoney(Math.round(totalPaidSum)) : "—"} color={C.gold} />
-        <div style={{ marginLeft: "auto", fontSize: 11, color: C.muted }}>Хв. часу: {fmtMins(totalWorkMin)}</div>
+        <SumCard label="Отработано, ч"    value={totalWorkMin > 0 ? (totalWorkMin / 60).toFixed(2) : "—"} color={C.dark} />
+        <SumCard label="К оплате, ч"      value={billableMin > 0 ? (billableMin / 60).toFixed(2) : "—"} color={C.success} />
+        <SumCard label="Оплачено, ч"      value={totalPaidHours > 0 ? totalPaidHours.toFixed(2) : "—"} color={C.blue} />
+        <SumCard label="Разница (счёт), ч" value={billableMin > 0 || totalPaidHours > 0 ? (diffHours >= 0 ? "+" : "") + diffHours.toFixed(2) : "—"} color={diffHours < -0.01 ? C.danger : C.success} />
+        <SumCard label="Оплачено, ₴"      value={totalPaidSum > 0 ? fmtMoney(Math.round(totalPaidSum)) : "—"} color={C.gold} />
+        <div style={{ marginLeft: "auto", fontSize: 11, color: C.muted }}>Мин. времени: {fmtMins(totalWorkMin)}</div>
       </div>
 
       <main style={{ flex: 1, padding: 16, overflow: "auto" }}>
@@ -332,6 +464,7 @@ export default function App() {
         {tab === "time"     && <TimeTab rows={rows} onAddRow={addRow} onAddDivider={addDivider} onUpdRow={updRow} onRmRow={rmRow} totalWorkMin={totalWorkMin} />}
         {tab === "payments" && <PaymentsTab payments={payments} onAdd={addPayment} onUpd={updPay} onRm={rmPay} totalPaidHours={totalPaidHours} totalPaidSum={totalPaidSum} />}
         {tab === "kb"       && <KbTab items={knowledge} onAdd={addKb} onUpd={updKb} onRm={rmKb} />}
+        {tab === "visits"   && <VisitsTab visits={visits} />}
       </main>
     </div>
   );
@@ -726,7 +859,7 @@ function TaskRow({ task, orderedCols, pinnedBorderIdx, activeTimer, timerElapsed
   };
 
   return (
-    <tr style={{ background: isActive ? "rgba(220,38,38,.02)" : "#fff" }}
+    <tr data-task-row style={{ background: isActive ? "rgba(220,38,38,.02)" : "#fff" }}
       onMouseEnter={e => e.currentTarget.style.background = isActive ? "rgba(220,38,38,.05)" : "#FDFCFB"}
       onMouseLeave={e => e.currentTarget.style.background = isActive ? "rgba(220,38,38,.02)" : "#fff"}>
       {orderedCols.map((col, ci) => renderCell(col, ci))}
@@ -862,7 +995,7 @@ function TimeRow({ row, onUpd, onRm, onAddBelow }) {
   const rowBg       = nb ? "rgba(220,38,38,.06)" : "#fff";
   const rowBgHover  = nb ? "rgba(220,38,38,.11)" : "#FDFCFB";
   return (
-    <tr onMouseEnter={e => e.currentTarget.style.background = rowBgHover}
+    <tr data-time-row onMouseEnter={e => e.currentTarget.style.background = rowBgHover}
       onMouseLeave={e => e.currentTarget.style.background = rowBg}
       style={{ background: rowBg }}>
       <td style={{ ...tdS, borderLeft: nb ? `3px solid rgba(220,38,38,.45)` : "none" }}>
@@ -946,15 +1079,15 @@ function PaymentsTab({ payments, onAdd, onUpd, onRm, totalPaidHours, totalPaidSu
   return (
     <div style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, boxShadow: "0 1px 4px rgba(0,0,0,.07)", overflow: "hidden" }}>
       <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 10 }}>
-        <div style={{ fontWeight: 700, fontSize: 15, color: C.dark }}>💳 Оплати від клієнта</div>
-        <span style={{ fontSize: 11, color: C.muted, marginLeft: "auto" }}>Enter — новий рядок</span>
+        <div style={{ fontWeight: 700, fontSize: 15, color: C.dark }}>💳 Оплаты от клиента</div>
+        <span style={{ fontSize: 11, color: C.muted, marginLeft: "auto" }}>Enter — новая строка</span>
       </div>
       <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 500 }}>
           <thead><tr>
             <th style={{ ...thS, width: 140 }}>ДАТА</th>
-            <th style={{ ...thS, width: 100, textAlign: "center" }}>ГОДИНИ</th>
-            <th style={{ ...thS, width: 160, textAlign: "center" }}>ВАРТІСТЬ 1 ГОДИНИ, ₴</th>
+            <th style={{ ...thS, width: 100, textAlign: "center" }}>ЧАСЫ</th>
+            <th style={{ ...thS, width: 160, textAlign: "center" }}>СТОИМОСТЬ 1 ЧАСА, ₴</th>
             <th style={{ ...thS, width: 140, textAlign: "center" }}>СУМА, ₴</th>
             <th style={{ ...thS, width: 28 }} />
           </tr></thead>
@@ -993,8 +1126,8 @@ function PaymentsTab({ payments, onAdd, onUpd, onRm, totalPaidHours, totalPaidSu
           {payments.length > 0 && (
             <tfoot>
               <tr style={{ background: "#F9F8F6" }}>
-                <td style={{ ...tdS, fontWeight: 700, fontSize: 12, color: C.muted, letterSpacing: 0.5 }}>РАЗОМ</td>
-                <td style={{ ...tdS, textAlign: "center", fontWeight: 700, color: C.dark }}>{totalPaidHours > 0 ? totalPaidHours.toFixed(2) + " год" : "—"}</td>
+                <td style={{ ...tdS, fontWeight: 700, fontSize: 12, color: C.muted, letterSpacing: 0.5 }}>ИТОГО</td>
+                <td style={{ ...tdS, textAlign: "center", fontWeight: 700, color: C.dark }}>{totalPaidHours > 0 ? totalPaidHours.toFixed(2) + " ч" : "—"}</td>
                 <td />
                 <td style={{ ...tdS, textAlign: "center", fontWeight: 700, color: C.success }}>{totalPaidSum > 0 ? fmtMoney(Math.round(totalPaidSum)) + " ₴" : "—"}</td>
                 <td />
@@ -1002,6 +1135,146 @@ function PaymentsTab({ payments, onAdd, onUpd, onRm, totalPaidHours, totalPaidSu
             </tfoot>
           )}
         </table>
+      </div>
+    </div>
+  );
+}
+
+/* ─── ONLINE PANEL ───────────────────────────────────────── */
+function OnlinePanel({ users, onClose }) {
+  useEffect(() => {
+    const h = (e) => { if (!e.target.closest("[data-online-panel]")) onClose(); };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  return (
+    <div data-online-panel style={{ position: "absolute", top: "110%", left: 0, background: C.dark, border: "1px solid rgba(255,255,255,.12)", borderRadius: 12, minWidth: 280, zIndex: 500, boxShadow: "0 8px 24px rgba(0,0,0,.4)", overflow: "hidden" }}>
+      <div style={{ padding: "10px 14px", borderBottom: "1px solid rgba(255,255,255,.08)", fontSize: 11, fontWeight: 700, color: "#9CA3AF", letterSpacing: .5 }}>
+        СЕЙЧАС ОНЛАЙН — {users.length}
+      </div>
+      {users.length === 0 && <div style={{ padding: "14px", fontSize: 13, color: "#6B7280" }}>Нет активных пользователей</div>}
+      {users.map((u, i) => (
+        <div key={i} style={{ padding: "10px 14px", borderBottom: "1px solid rgba(255,255,255,.05)", display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#4ADE80", flexShrink: 0 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 12, color: "#E5E7EB", fontWeight: 600 }}>
+              {u.device || "🖥 Компьютер"} · {u.browser || "—"} / {u.os || "—"}
+            </div>
+            <div style={{ fontSize: 10, color: "#6B7280", marginTop: 2 }}>
+              {[u.city, u.country].filter(Boolean).join(", ") || "Локация неизвестна"}
+              {u.ip && <span style={{ marginLeft: 6 }}>· {u.ip}</span>}
+            </div>
+          </div>
+          <div style={{ fontSize: 10, color: "#4B5563" }}>
+            {u.joinedAt ? new Date(u.joinedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : ""}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ─── VISITS TAB ─────────────────────────────────────────── */
+function VisitsTab({ visits }) {
+  const now = Date.now();
+
+  // Уникальные посетители (по session_id)
+  const unique = new Set(visits.map(v => v.session_id)).size;
+  // Онлайн сейчас (last_seen < 2 мин назад)
+  const activeNow = visits.filter(v => v.last_seen && now - new Date(v.last_seen).getTime() < 2 * 60 * 1000).length;
+
+  const fmtDiff = (iso) => {
+    if (!iso) return "—";
+    const diff = Math.floor((now - new Date(iso).getTime()) / 60000);
+    if (diff < 1) return "только что";
+    if (diff < 60) return `${diff} мин назад`;
+    if (diff < 1440) return `${Math.floor(diff / 60)} ч назад`;
+    return `${Math.floor(diff / 1440)} дн назад`;
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {/* Summary cards */}
+      <div style={{ display: "flex", gap: 12 }}>
+        {[
+          { label: "Всего сессий", value: visits.length, color: C.dark, icon: "📋" },
+          { label: "Уникальных", value: unique, color: C.blue, icon: "👤" },
+          { label: "Онлайн сейчас", value: activeNow, color: "#4ADE80", icon: "🟢" },
+        ].map(({ label, value, color, icon }) => (
+          <div key={label} style={{ ...cardS, flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+            <div style={{ fontSize: 18 }}>{icon}</div>
+            <div style={{ fontSize: 26, fontWeight: 700, color }}>{value}</div>
+            <div style={{ fontSize: 11, color: C.muted, fontWeight: 600 }}>{label.toUpperCase()}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Visits table */}
+      <div style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, boxShadow: "0 1px 4px rgba(0,0,0,.07)", overflow: "hidden" }}>
+        <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, fontWeight: 700, fontSize: 15, color: C.dark }}>
+          👁 История посещений
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 700 }}>
+            <thead><tr>
+              <th style={thS}>СТАТУС</th>
+              <th style={thS}>БРАУЗЕР / ОС</th>
+              <th style={thS}>УСТРОЙСТВО</th>
+              <th style={thS}>ГОРОД / СТРАНА</th>
+              <th style={thS}>IP</th>
+              <th style={thS}>ПЕРВЫЙ ВИЗИТ</th>
+              <th style={thS}>БЫЛ ОНЛАЙН</th>
+            </tr></thead>
+            <tbody>
+              {visits.length === 0 && (
+                <tr><td colSpan={7} style={{ ...tdS, textAlign: "center", color: C.muted, padding: "32px 0" }}>
+                  Нет данных о посещениях
+                </td></tr>
+              )}
+              {visits.map((v) => {
+                const isActive = v.last_seen && now - new Date(v.last_seen).getTime() < 2 * 60 * 1000;
+                return (
+                  <tr key={v.id}
+                    onMouseEnter={e => e.currentTarget.style.background = "#FDFCFB"}
+                    onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+                    <td style={{ ...tdS, textAlign: "center" }}>
+                      {isActive
+                        ? <span style={{ display: "inline-flex", alignItems: "center", gap: 5, background: "rgba(74,222,128,.12)", color: "#16A34A", borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
+                            <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ADE80", animation: "blink 1.2s infinite" }} />онлайн
+                          </span>
+                        : <span style={{ fontSize: 11, color: C.muted }}>оффлайн</span>}
+                    </td>
+                    <td style={{ ...tdS, fontSize: 12 }}>
+                      <div style={{ fontWeight: 600 }}>{v.browser || "—"}</div>
+                      <div style={{ color: C.muted, fontSize: 11 }}>{v.os || "—"}</div>
+                    </td>
+                    <td style={{ ...tdS, fontSize: 12 }}>{v.device || "🖥 Компьютер"}</td>
+                    <td style={{ ...tdS, fontSize: 12 }}>
+                      {[v.city, v.country].filter(Boolean).join(", ") || <span style={{ color: C.muted }}>—</span>}
+                    </td>
+                    <td style={{ ...tdS, fontSize: 12, fontFamily: "monospace" }}>{v.ip || "—"}</td>
+                    <td style={{ ...tdS, fontSize: 11, color: C.muted }}>
+                      {v.visited_at ? new Date(v.visited_at).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}
+                    </td>
+                    <td style={{ ...tdS, fontSize: 11, color: C.muted }}>{fmtDiff(v.last_seen)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Recommendation block */}
+      <div style={{ ...cardS, background: C.goldLight, border: `1px solid rgba(200,146,42,.3)` }}>
+        <div style={{ fontWeight: 700, fontSize: 14, color: "#8B5E10", marginBottom: 8 }}>💡 Также рекомендуем подключить</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 13, color: C.text }}>
+          <div><b>Microsoft Clarity</b> — бесплатные тепловые карты и запись сессий. Видно куда кликает пользователь.</div>
+          <div><b>Уведомления</b> — получать уведомление в Telegram когда клиент открыл страницу.</div>
+          <div><b>Время на странице</b> — уже считается (last_seen обновляется каждые 30 сек).</div>
+          <div><b>Активность по дням</b> — график посещений по датам можно добавить следующим шагом.</div>
+        </div>
       </div>
     </div>
   );
