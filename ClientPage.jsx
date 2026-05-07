@@ -102,6 +102,7 @@ const thS = {
   whiteSpace: "nowrap", letterSpacing: 0.3, userSelect: "none",
 };
 const tdS = { padding: "5px 7px", fontSize: 13, borderBottom: `1px solid #F5F4F1`, verticalAlign: "middle" };
+const cardS = { background: "#FFFFFF", borderRadius: 12, boxShadow: "0 1px 4px rgba(0,0,0,.07)", padding: 16 };
 
 const STATUS_CFG = {
   new:         { label: "Начато",    color: "#6B7280", bg: "#F3F4F6" },
@@ -145,6 +146,7 @@ export default function App() {
   const [showOnline,   setShowOnline]   = useState(false);
   const lastSavedRef       = useRef(null);
   const presenceChannelRef = useRef(null);
+  const initialLoadDone    = useRef(false);
 
   // Supabase sync state
   const [loaded,     setLoaded]     = useState(false);
@@ -248,6 +250,8 @@ export default function App() {
   /* ── Save to Supabase (debounced 800ms) ── */
   useEffect(() => {
     if (!loaded) return;
+    // Пропускаем первый запуск сразу после загрузки — не затираем данные из БД
+    if (!initialLoadDone.current) { initialLoadDone.current = true; return; }
     setSyncStatus("saving");
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(async () => {
