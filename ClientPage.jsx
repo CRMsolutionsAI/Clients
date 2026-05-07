@@ -20,12 +20,16 @@ function parseUA(ua = navigator.userAgent) {
     /Chrome\//.test(ua)  ? "Chrome"  :
     /Firefox\//.test(ua) ? "Firefox" :
     /Safari\//.test(ua)  ? "Safari"  : "Unknown";
+  const winVer  = /Windows NT ([\d.]+)/.exec(ua)?.[1];
+  const macVer  = /Mac OS X ([\d_]+)/.exec(ua)?.[1]?.replace(/_/g, ".");
+  const andVer  = /Android ([\d.]+)/.exec(ua)?.[1];
   const os =
-    /Windows/.test(ua)        ? "Windows" :
-    /iPhone|iPad/.test(ua)    ? "iOS"     :
-    /Mac OS X/.test(ua)       ? "Mac"     :
-    /Android/.test(ua)        ? "Android" :
-    /Linux/.test(ua)          ? "Linux"   : "Unknown";
+    winVer             ? `Windows ${winVer}`  :
+    /iPhone/.test(ua)  ? "iOS (iPhone)"       :
+    /iPad/.test(ua)    ? "iOS (iPad)"         :
+    macVer             ? `Mac OS ${macVer}`   :
+    andVer             ? `Android ${andVer}`  :
+    /Linux/.test(ua)   ? "Linux"              : "Unknown";
   const device = /Mobi|Android/i.test(ua) ? "📱 Мобильный" : "🖥 Компьютер";
   return { browser, os, device };
 }
@@ -181,59 +185,19 @@ export default function App() {
     return () => supabase.removeChannel(ch);
   }, []);
 
-  /* ── Presence (online users) ── */
+  /* ── Load: сначала localStorage (мгновенно), потом Supabase (override) ── */
   useEffect(() => {
-    const ch = supabase.channel(`presence:${CLIENT_ID}`, { config: { presence: { key: SESSION_ID } } });
-    presenceChannelRef.current = ch;
-    ch.on("presence", { event: "sync" }, () => {
-        setOnlineUsers(Object.values(ch.presenceState()).flat());
-      })
-      .subscribe(async (status) => {
-        if (status === "SUBSCRIBED") {
-          await ch.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, joinedAt: new Date().toISOString() });
-        }
-      });
-    return () => supabase.removeChannel(ch);
-  }, []);
+    // 1. Загружаем из localStorage сразу — без мигания
+    try {
+      const local = JSON.parse(localStorage.getItem(`cp:${CLIENT_ID}`) || "{}");
+      if (local.clientName)        setClientName(local.clientName);
+      if (local.rows?.length)      setRows(local.rows);
+      if (local.payments?.length)  setPayments(local.payments);
+      if (local.knowledge?.length) setKnowledge(local.knowledge);
+      if (local.tasks?.length)     setTasks(local.tasks);
+    } catch {}
 
-  /* ── Update presence with geo when loaded ── */
-  useEffect(() => {
-    if (!geoData || !presenceChannelRef.current) return;
-    presenceChannelRef.current.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, city: geoData.city, country: geoData.country, ip: geoData.query, joinedAt: new Date().toISOString() });
-  }, [geoData]);
-
-  /* ── Log visit ── */
-  useEffect(() => {
-    if (!loaded) return;
-    const logVisit = () => supabase.from("visits").upsert({
-      session_id: SESSION_ID, client_id: CLIENT_ID,
-      browser: MY_BROWSER, os: MY_OS,
-      ip: geoData?.query || null, country: geoData?.country || null, city: geoData?.city || null,
-      last_seen: new Date().toISOString(),
-    }, { onConflict: "session_id" });
-    logVisit();
-    const iv = setInterval(logVisit, 30000); // обновляем last_seen каждые 30 сек
-    return () => clearInterval(iv);
-  }, [loaded, geoData]);
-
-  /* ── Load visits history ── */
-  useEffect(() => {
-    if (!loaded) return;
-    supabase.from("visits").select("*").eq("client_id", CLIENT_ID).order("last_seen", { ascending: false }).limit(200)
-      .then(({ data }) => { if (data) setVisits(data); });
-    // Realtime для новых визитов
-    const ch = supabase.channel(`visits:${CLIENT_ID}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "visits", filter: `client_id=eq.${CLIENT_ID}` },
-        () => {
-          supabase.from("visits").select("*").eq("client_id", CLIENT_ID).order("last_seen", { ascending: false }).limit(200)
-            .then(({ data }) => { if (data) setVisits(data); });
-        })
-      .subscribe();
-    return () => supabase.removeChannel(ch);
-  }, [loaded]);
-
-  /* ── Load from Supabase on mount ── */
-  useEffect(() => {
+    // 2. Загружаем из Supabase (перезаписывает если есть)
     supabase.from("client_data").select("*").eq("client_id", CLIENT_ID).maybeSingle()
       .then(({ data }) => {
         if (data) {
@@ -244,14 +208,19 @@ export default function App() {
           if (data.tasks?.length)     setTasks(data.tasks);
         }
         setLoaded(true);
-      });
+      })
+      .catch(() => setLoaded(true));
   }, []);
 
-  /* ── Save to Supabase (debounced 800ms) ── */
+  /* ── Save: в localStorage сразу + в Supabase с debounce ── */
   useEffect(() => {
     if (!loaded) return;
-    // Пропускаем первый запуск сразу после загрузки — не затираем данные из БД
     if (!initialLoadDone.current) { initialLoadDone.current = true; return; }
+
+    // localStorage — мгновенно
+    try { localStorage.setItem(`cp:${CLIENT_ID}`, JSON.stringify({ clientName, rows, payments, knowledge, tasks })); } catch {}
+
+    // Supabase — с задержкой
     setSyncStatus("saving");
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(async () => {
@@ -266,6 +235,59 @@ export default function App() {
       else { setSyncStatus("saved"); setTimeout(() => setSyncStatus("idle"), 2500); }
     }, 800);
   }, [loaded, clientName, rows, payments, knowledge, tasks]);
+
+  /* ── Presence (online users) — дедупликация по session_id ── */
+  useEffect(() => {
+    const ch = supabase.channel(`presence:${CLIENT_ID}`, { config: { presence: { key: SESSION_ID } } });
+    presenceChannelRef.current = ch;
+    ch.on("presence", { event: "sync" }, () => {
+        const all = Object.values(ch.presenceState()).flat();
+        // Дедупликация: одна запись на session_id
+        const unique = Object.values(Object.fromEntries(all.map(u => [u.session_id || u.joinedAt, u])));
+        setOnlineUsers(unique);
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          await ch.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, joinedAt: new Date().toISOString() });
+        }
+      });
+    return () => supabase.removeChannel(ch);
+  }, []);
+
+  /* ── Обновляем presence с гео ── */
+  useEffect(() => {
+    if (!geoData || !presenceChannelRef.current) return;
+    presenceChannelRef.current.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, city: geoData.city, country: geoData.country, ip: geoData.query, joinedAt: new Date().toISOString() });
+  }, [geoData]);
+
+  /* ── Логируем визит ── */
+  useEffect(() => {
+    if (!loaded) return;
+    const logVisit = () => supabase.from("visits").upsert({
+      session_id: SESSION_ID, client_id: CLIENT_ID,
+      browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE,
+      ip: geoData?.query || null, country: geoData?.country || null, city: geoData?.city || null,
+      last_seen: new Date().toISOString(),
+    }, { onConflict: "session_id" });
+    logVisit();
+    const iv = setInterval(logVisit, 30000);
+    return () => clearInterval(iv);
+  }, [loaded, geoData]);
+
+  /* ── Загружаем историю визитов ── */
+  useEffect(() => {
+    if (!loaded) return;
+    const fetchVisits = () =>
+      supabase.from("visits").select("*").eq("client_id", CLIENT_ID)
+        .order("last_seen", { ascending: false }).limit(200)
+        .then(({ data }) => { if (data?.length) setVisits(data); });
+    fetchVisits();
+    const ch = supabase.channel(`visits:${CLIENT_ID}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "visits", filter: `client_id=eq.${CLIENT_ID}` },
+        fetchVisits)
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, [loaded]);
 
   /* ── Stop timer ── */
   const stopTimer = useCallback(() => {
