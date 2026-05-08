@@ -13,6 +13,12 @@ function getSessionId() {
   if (!id) { id = Date.now().toString(36) + Math.random().toString(36).slice(2); sessionStorage.setItem("cp:sid", id); }
   return id;
 }
+// USER_ID — одинаковый для всех вкладок одного браузера
+function getUserId() {
+  let id = localStorage.getItem("cp:uid");
+  if (!id) { id = Date.now().toString(36) + Math.random().toString(36).slice(2); localStorage.setItem("cp:uid", id); }
+  return id;
+}
 function parseUA(ua = navigator.userAgent) {
   const browser =
     /Edg\//.test(ua)     ? "Edge"    :
@@ -34,6 +40,7 @@ function parseUA(ua = navigator.userAgent) {
   return { browser, os, device };
 }
 const SESSION_ID = getSessionId();
+const USER_ID    = getUserId(); // одинаков для всех вкладок одного браузера
 const { browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE } = parseUA();
 
 /* ─── HELPERS ───────────────────────────────────────────── */
@@ -149,7 +156,8 @@ export default function App() {
   const [logs,         setLogs]         = useState([]);
   const [geoData,      setGeoData]      = useState(null);
   const [showOnline,   setShowOnline]   = useState(false);
-  const geoRef = useRef(null);
+  const geoRef             = useRef(null);
+  const lastSavedRef       = useRef(null);
   useEffect(() => { geoRef.current = geoData; }, [geoData]);
 
   const logAction = useCallback((action, entity, entityName) => {
@@ -255,7 +263,7 @@ export default function App() {
 
   /* ── Presence — дедупликация по IP ── */
   useEffect(() => {
-    const ch = supabase.channel(`presence:${CLIENT_ID}`, { config: { presence: { key: SESSION_ID } } });
+    const ch = supabase.channel(`presence:${CLIENT_ID}`, { config: { presence: { key: USER_ID } } });
     presenceChannelRef.current = ch;
     ch.on("presence", { event: "sync" }, () => {
         const all = Object.values(ch.presenceState()).flat();
@@ -270,7 +278,7 @@ export default function App() {
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
-          await ch.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, joinedAt: new Date().toISOString() });
+          await ch.track({ user_id: USER_ID, session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, joinedAt: new Date().toISOString() });
         }
       });
     return () => supabase.removeChannel(ch);
@@ -279,7 +287,7 @@ export default function App() {
   /* ── Обновляем presence с гео ── */
   useEffect(() => {
     if (!geoData || !presenceChannelRef.current) return;
-    presenceChannelRef.current.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, city: geoData.city, country: geoData.country, ip: geoData.query, joinedAt: new Date().toISOString() });
+    presenceChannelRef.current.track({ user_id: USER_ID, session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, city: geoData.city, country: geoData.country, ip: geoData.query, joinedAt: new Date().toISOString() });
   }, [geoData]);
 
   /* ── Загружаем логи ── */
