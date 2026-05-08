@@ -146,9 +146,26 @@ export default function App() {
   // Realtime / presence / analytics
   const [onlineUsers,  setOnlineUsers]  = useState([]);
   const [visits,       setVisits]       = useState([]);
+  const [logs,         setLogs]         = useState([]);
   const [geoData,      setGeoData]      = useState(null);
   const [showOnline,   setShowOnline]   = useState(false);
-  const lastSavedRef       = useRef(null);
+  const geoRef = useRef(null);
+  useEffect(() => { geoRef.current = geoData; }, [geoData]);
+
+  const logAction = useCallback((action, entity, entityName) => {
+    supabase.from("logs").insert({
+      client_id: CLIENT_ID, session_id: SESSION_ID,
+      action, entity, entity_name: entityName,
+      browser: MY_BROWSER, os: MY_OS,
+      ip: geoRef.current?.query || null,
+    });
+    setLogs(prev => [{
+      id: mkId(), action, entity, entity_name: entityName,
+      browser: MY_BROWSER, os: MY_OS,
+      ip: geoRef.current?.query || null,
+      created_at: new Date().toISOString(),
+    }, ...prev]);
+  }, []);
   const presenceChannelRef = useRef(null);
   const initialLoadDone    = useRef(false);
 
@@ -236,15 +253,20 @@ export default function App() {
     }, 800);
   }, [loaded, clientName, rows, payments, knowledge, tasks]);
 
-  /* ── Presence (online users) — дедупликация по session_id ── */
+  /* ── Presence — дедупликация по IP ── */
   useEffect(() => {
     const ch = supabase.channel(`presence:${CLIENT_ID}`, { config: { presence: { key: SESSION_ID } } });
     presenceChannelRef.current = ch;
     ch.on("presence", { event: "sync" }, () => {
         const all = Object.values(ch.presenceState()).flat();
-        // Дедупликация: одна запись на session_id
-        const unique = Object.values(Object.fromEntries(all.map(u => [u.session_id || u.joinedAt, u])));
-        setOnlineUsers(unique);
+        // Дедупликация по IP (если есть) — иначе по session_id
+        const seen = new Map();
+        all.forEach(u => {
+          const key = u.ip || u.session_id;
+          const existing = seen.get(key);
+          if (!existing || new Date(u.joinedAt) > new Date(existing.joinedAt)) seen.set(key, u);
+        });
+        setOnlineUsers([...seen.values()]);
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
@@ -259,6 +281,19 @@ export default function App() {
     if (!geoData || !presenceChannelRef.current) return;
     presenceChannelRef.current.track({ session_id: SESSION_ID, browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE, city: geoData.city, country: geoData.country, ip: geoData.query, joinedAt: new Date().toISOString() });
   }, [geoData]);
+
+  /* ── Загружаем логи ── */
+  useEffect(() => {
+    if (!loaded) return;
+    supabase.from("logs").select("*").eq("client_id", CLIENT_ID)
+      .order("created_at", { ascending: false }).limit(500)
+      .then(({ data }) => { if (data?.length) setLogs(data); });
+    const ch = supabase.channel(`logs:${CLIENT_ID}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "logs", filter: `client_id=eq.${CLIENT_ID}` },
+        (payload) => setLogs(prev => [payload.new, ...prev].slice(0, 500)))
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, [loaded]);
 
   /* ── Логируем визит ── */
   useEffect(() => {
@@ -344,6 +379,7 @@ export default function App() {
   const addTask = (afterIdx) => {
     const nt = { id: mkId(), name: "", status: "new", result: "", planTime: "", notBillable: false, createdAt: new Date().toISOString(), sessions: [] };
     setTasks(prev => { const n = [...prev]; n.splice((afterIdx ?? n.length) + 1, 0, nt); return n; });
+    logAction("added", "task", "Новая задача");
     setTimeout(() => {
       const rows = document.querySelectorAll("[data-task-row]");
       const last = rows[rows.length - 1];
@@ -351,30 +387,36 @@ export default function App() {
     }, 30);
   };
   const updTask = (id, f, v) => setTasks(prev => prev.map(t => t.id === id ? { ...t, [f]: v } : t));
-  const rmTask  = (id) => { if (activeTimerRef.current?.taskId === id) stopTimerRef.current(); setTasks(prev => prev.filter(t => t.id !== id)); };
+  const rmTask  = (id) => {
+    const task = tasks.find(t => t.id === id);
+    logAction("deleted", "task", task?.name || "—");
+    if (activeTimerRef.current?.taskId === id) stopTimerRef.current();
+    setTasks(prev => prev.filter(t => t.id !== id));
+  };
 
   /* ── Rows CRUD ── */
   const addRow = (ai) => {
     setRows(prev => { const n = [...prev]; n.splice(ai + 1, 0, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: false }); return n; });
+    logAction("added", "time_row", "Новая строка времени");
     setTimeout(() => {
       const rows = document.querySelectorAll("[data-time-row]");
       const last = rows[rows.length - 1];
       if (last) { const inp = last.querySelector("input"); inp?.focus(); }
     }, 30);
   };
-  const addDivider = () => setRows(r => [...r, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: true, label: "" }]);
+  const addDivider = () => { setRows(r => [...r, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: true, label: "" }]); logAction("added", "time_row", "Закрытие фронта работы"); };
   const updRow     = (id, f, v) => setRows(r => r.map(x => x.id === id ? { ...x, [f]: v } : x));
-  const rmRow      = (id) => setRows(r => r.filter(x => x.id !== id));
+  const rmRow      = (id) => { const row = rows.find(r => r.id === id); logAction("deleted", "time_row", row?.result || row?.date || "—"); setRows(r => r.filter(x => x.id !== id)); };
 
   /* ── Payments CRUD ── */
-  const addPayment = (ai) => setPayments(prev => { const n = [...prev]; n.splice((ai ?? n.length - 1) + 1, 0, { id: mkId(), date: "", hours: "", pricePerHour: "" }); return n; });
+  const addPayment = (ai) => { setPayments(prev => { const n = [...prev]; n.splice((ai ?? n.length - 1) + 1, 0, { id: mkId(), date: "", hours: "", pricePerHour: "" }); return n; }); logAction("added", "payment", "Новая оплата"); };
   const updPay     = (id, f, v) => setPayments(p => p.map(x => x.id === id ? { ...x, [f]: v } : x));
-  const rmPay      = (id) => setPayments(p => p.filter(x => x.id !== id));
+  const rmPay      = (id) => { const p = payments.find(x => x.id === id); logAction("deleted", "payment", p?.date || "—"); setPayments(p => p.filter(x => x.id !== id)); };
 
   /* ── KB CRUD ── */
-  const addKb = (ai) => setKnowledge(prev => { const n = [...prev]; n.splice((ai ?? n.length - 1) + 1, 0, { id: mkId(), name: "", url: "" }); return n; });
+  const addKb = (ai) => { setKnowledge(prev => { const n = [...prev]; n.splice((ai ?? n.length - 1) + 1, 0, { id: mkId(), name: "", url: "" }); return n; }); logAction("added", "kb", "Новая запись"); };
   const updKb = (id, f, v) => setKnowledge(k => k.map(x => x.id === id ? { ...x, [f]: v } : x));
-  const rmKb  = (id) => setKnowledge(k => k.filter(x => x.id !== id));
+  const rmKb  = (id) => { const k = knowledge.find(x => x.id === id); logAction("deleted", "kb", k?.name || "—"); setKnowledge(k => k.filter(x => x.id !== id)); };
 
   /* ── Summaries ── */
   const totalWorkMin   = rows.filter(r => !r.isDivider).reduce((s, r) => s + (parseTimeRange(combineRange(r.timeStart, r.timeEnd)) || 0), 0);
@@ -490,7 +532,7 @@ export default function App() {
         {tab === "time"     && <TimeTab rows={rows} onAddRow={addRow} onAddDivider={addDivider} onUpdRow={updRow} onRmRow={rmRow} totalWorkMin={totalWorkMin} />}
         {tab === "payments" && <PaymentsTab payments={payments} onAdd={addPayment} onUpd={updPay} onRm={rmPay} totalPaidHours={totalPaidHours} totalPaidSum={totalPaidSum} />}
         {tab === "kb"       && <KbTab items={knowledge} onAdd={addKb} onUpd={updKb} onRm={rmKb} />}
-        {tab === "visits"   && <VisitsTab visits={visits} />}
+        {tab === "visits"   && <VisitsTab visits={visits} logs={logs} />}
       </main>
     </div>
   );
@@ -1202,12 +1244,17 @@ function OnlinePanel({ users, onClose }) {
 }
 
 /* ─── VISITS TAB ─────────────────────────────────────────── */
-function VisitsTab({ visits }) {
-  const now = Date.now();
+const ENTITY_LABELS = { task: "Задача", time_row: "Строка времени", payment: "Оплата", kb: "База знаний" };
+const ACTION_CFG = {
+  added:   { label: "Добавил",  color: "#059669", bg: "rgba(5,150,105,.1)"  },
+  deleted: { label: "Удалил",   color: "#DC2626", bg: "rgba(220,38,38,.1)"  },
+  updated: { label: "Изменил",  color: "#D97706", bg: "rgba(217,119,6,.1)"  },
+};
 
-  // Уникальные посетители (по session_id)
-  const unique = new Set(visits.map(v => v.session_id)).size;
-  // Онлайн сейчас (last_seen < 2 мин назад)
+function VisitsTab({ visits, logs }) {
+  const [activeSection, setActiveSection] = useState("visits"); // visits | logs
+  const now = Date.now();
+  const unique   = new Set(visits.map(v => v.ip || v.session_id)).size;
   const activeNow = visits.filter(v => v.last_seen && now - new Date(v.last_seen).getTime() < 2 * 60 * 1000).length;
 
   const fmtDiff = (iso) => {
@@ -1224,9 +1271,10 @@ function VisitsTab({ visits }) {
       {/* Summary cards */}
       <div style={{ display: "flex", gap: 12 }}>
         {[
-          { label: "Всего сессий", value: visits.length, color: C.dark, icon: "📋" },
-          { label: "Уникальных", value: unique, color: C.blue, icon: "👤" },
-          { label: "Онлайн сейчас", value: activeNow, color: "#4ADE80", icon: "🟢" },
+          { label: "Всего сессий",    value: visits.length,  color: C.dark,     icon: "📋" },
+          { label: "Уникальных (IP)", value: unique,          color: C.blue,     icon: "👤" },
+          { label: "Онлайн сейчас",   value: activeNow,       color: "#4ADE80",  icon: "🟢" },
+          { label: "Действий в логе", value: logs.length,     color: C.gold,     icon: "📝" },
         ].map(({ label, value, color, icon }) => (
           <div key={label} style={{ ...cardS, flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
             <div style={{ fontSize: 18 }}>{icon}</div>
@@ -1236,70 +1284,128 @@ function VisitsTab({ visits }) {
         ))}
       </div>
 
-      {/* Visits table */}
-      <div style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, boxShadow: "0 1px 4px rgba(0,0,0,.07)", overflow: "hidden" }}>
-        <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, fontWeight: 700, fontSize: 15, color: C.dark }}>
-          👁 История посещений
-        </div>
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 700 }}>
-            <thead><tr>
-              <th style={thS}>СТАТУС</th>
-              <th style={thS}>БРАУЗЕР / ОС</th>
-              <th style={thS}>УСТРОЙСТВО</th>
-              <th style={thS}>ГОРОД / СТРАНА</th>
-              <th style={thS}>IP</th>
-              <th style={thS}>ПЕРВЫЙ ВИЗИТ</th>
-              <th style={thS}>БЫЛ ОНЛАЙН</th>
-            </tr></thead>
-            <tbody>
-              {visits.length === 0 && (
-                <tr><td colSpan={7} style={{ ...tdS, textAlign: "center", color: C.muted, padding: "32px 0" }}>
-                  Нет данных о посещениях
-                </td></tr>
-              )}
-              {visits.map((v) => {
-                const isActive = v.last_seen && now - new Date(v.last_seen).getTime() < 2 * 60 * 1000;
-                return (
-                  <tr key={v.id}
-                    onMouseEnter={e => e.currentTarget.style.background = "#FDFCFB"}
-                    onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
-                    <td style={{ ...tdS, textAlign: "center" }}>
-                      {isActive
-                        ? <span style={{ display: "inline-flex", alignItems: "center", gap: 5, background: "rgba(74,222,128,.12)", color: "#16A34A", borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
-                            <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ADE80", animation: "blink 1.2s infinite" }} />онлайн
-                          </span>
-                        : <span style={{ fontSize: 11, color: C.muted }}>оффлайн</span>}
-                    </td>
-                    <td style={{ ...tdS, fontSize: 12 }}>
-                      <div style={{ fontWeight: 600 }}>{v.browser || "—"}</div>
-                      <div style={{ color: C.muted, fontSize: 11 }}>{v.os || "—"}</div>
-                    </td>
-                    <td style={{ ...tdS, fontSize: 12 }}>{v.device || "🖥 Компьютер"}</td>
-                    <td style={{ ...tdS, fontSize: 12 }}>
-                      {[v.city, v.country].filter(Boolean).join(", ") || <span style={{ color: C.muted }}>—</span>}
-                    </td>
-                    <td style={{ ...tdS, fontSize: 12, fontFamily: "monospace" }}>{v.ip || "—"}</td>
-                    <td style={{ ...tdS, fontSize: 11, color: C.muted }}>
-                      {v.visited_at ? new Date(v.visited_at).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}
-                    </td>
-                    <td style={{ ...tdS, fontSize: 11, color: C.muted }}>{fmtDiff(v.last_seen)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+      {/* Section toggle */}
+      <div style={{ display: "flex", background: "#F2EFE9", borderRadius: 9, padding: 3, gap: 1, border: `1px solid ${C.border}`, alignSelf: "flex-start" }}>
+        {[["visits", "👁 Посещения"], ["logs", "📝 Лог действий"]].map(([k, l]) => (
+          <button key={k} onClick={() => setActiveSection(k)}
+            style={{ padding: "6px 18px", borderRadius: 7, border: "none", background: activeSection === k ? C.card : "none", color: activeSection === k ? C.dark : C.muted, fontWeight: activeSection === k ? 700 : 400, fontSize: 13, cursor: "pointer", fontFamily: "inherit", boxShadow: activeSection === k ? "0 1px 4px rgba(0,0,0,.1)" : "none" }}>
+            {l}
+          </button>
+        ))}
       </div>
+
+      {/* Visits table */}
+      {activeSection === "visits" && (
+        <div style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, boxShadow: "0 1px 4px rgba(0,0,0,.07)", overflow: "hidden" }}>
+          <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, fontWeight: 700, fontSize: 15, color: C.dark }}>
+            👁 История посещений
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 700 }}>
+              <thead><tr>
+                <th style={thS}>СТАТУС</th>
+                <th style={thS}>БРАУЗЕР / ОС</th>
+                <th style={thS}>УСТРОЙСТВО</th>
+                <th style={thS}>ГОРОД / СТРАНА</th>
+                <th style={thS}>IP</th>
+                <th style={thS}>ПЕРВЫЙ ВИЗИТ</th>
+                <th style={thS}>БЫЛ ОНЛАЙН</th>
+              </tr></thead>
+              <tbody>
+                {visits.length === 0 && (
+                  <tr><td colSpan={7} style={{ ...tdS, textAlign: "center", color: C.muted, padding: "32px 0" }}>Нет данных о посещениях</td></tr>
+                )}
+                {visits.map((v) => {
+                  const isActive = v.last_seen && now - new Date(v.last_seen).getTime() < 2 * 60 * 1000;
+                  return (
+                    <tr key={v.id}
+                      onMouseEnter={e => e.currentTarget.style.background = "#FDFCFB"}
+                      onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+                      <td style={{ ...tdS, textAlign: "center" }}>
+                        {isActive
+                          ? <span style={{ display: "inline-flex", alignItems: "center", gap: 5, background: "rgba(74,222,128,.12)", color: "#16A34A", borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
+                              <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ADE80", animation: "blink 1.2s infinite" }} />онлайн
+                            </span>
+                          : <span style={{ fontSize: 11, color: C.muted }}>оффлайн</span>}
+                      </td>
+                      <td style={{ ...tdS, fontSize: 12 }}>
+                        <div style={{ fontWeight: 600 }}>{v.browser || "—"}</div>
+                        <div style={{ color: C.muted, fontSize: 11 }}>{v.os || "—"}</div>
+                      </td>
+                      <td style={{ ...tdS, fontSize: 12 }}>{v.device || "🖥 Компьютер"}</td>
+                      <td style={{ ...tdS, fontSize: 12 }}>{[v.city, v.country].filter(Boolean).join(", ") || <span style={{ color: C.muted }}>—</span>}</td>
+                      <td style={{ ...tdS, fontSize: 12, fontFamily: "monospace" }}>{v.ip || "—"}</td>
+                      <td style={{ ...tdS, fontSize: 11, color: C.muted }}>
+                        {v.visited_at ? new Date(v.visited_at).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}
+                      </td>
+                      <td style={{ ...tdS, fontSize: 11, color: C.muted }}>{fmtDiff(v.last_seen)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Logs table */}
+      {activeSection === "logs" && (
+        <div style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, boxShadow: "0 1px 4px rgba(0,0,0,.07)", overflow: "hidden" }}>
+          <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, fontWeight: 700, fontSize: 15, color: C.dark }}>
+            📝 Лог действий
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 600 }}>
+              <thead><tr>
+                <th style={thS}>ВРЕМЯ</th>
+                <th style={thS}>ДЕЙСТВИЕ</th>
+                <th style={thS}>РАЗДЕЛ</th>
+                <th style={thS}>ЧТО</th>
+                <th style={thS}>БРАУЗЕР / ОС</th>
+                <th style={thS}>IP</th>
+              </tr></thead>
+              <tbody>
+                {logs.length === 0 && (
+                  <tr><td colSpan={6} style={{ ...tdS, textAlign: "center", color: C.muted, padding: "32px 0" }}>Действий пока нет</td></tr>
+                )}
+                {logs.map((l) => {
+                  const ac = ACTION_CFG[l.action] || ACTION_CFG.updated;
+                  return (
+                    <tr key={l.id}
+                      onMouseEnter={e => e.currentTarget.style.background = "#FDFCFB"}
+                      onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+                      <td style={{ ...tdS, fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>
+                        {l.created_at ? new Date(l.created_at).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}
+                      </td>
+                      <td style={{ ...tdS }}>
+                        <span style={{ background: ac.bg, color: ac.color, borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
+                          {ac.label}
+                        </span>
+                      </td>
+                      <td style={{ ...tdS, fontSize: 12, color: C.muted }}>{ENTITY_LABELS[l.entity] || l.entity || "—"}</td>
+                      <td style={{ ...tdS, fontSize: 13, fontWeight: 500 }}>{l.entity_name || "—"}</td>
+                      <td style={{ ...tdS, fontSize: 11, color: C.muted }}>
+                        <div>{l.browser || "—"}</div>
+                        <div style={{ fontSize: 10 }}>{l.os || "—"}</div>
+                      </td>
+                      <td style={{ ...tdS, fontSize: 11, fontFamily: "monospace", color: C.muted }}>{l.ip || "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Recommendation block */}
       <div style={{ ...cardS, background: C.goldLight, border: `1px solid rgba(200,146,42,.3)` }}>
         <div style={{ fontWeight: 700, fontSize: 14, color: "#8B5E10", marginBottom: 8 }}>💡 Также рекомендуем подключить</div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 13, color: C.text }}>
-          <div><b>Microsoft Clarity</b> — бесплатные тепловые карты и запись сессий. Видно куда кликает пользователь.</div>
-          <div><b>Уведомления</b> — получать уведомление в Telegram когда клиент открыл страницу.</div>
-          <div><b>Время на странице</b> — уже считается (last_seen обновляется каждые 30 сек).</div>
-          <div><b>Активность по дням</b> — график посещений по датам можно добавить следующим шагом.</div>
+          <div><b>Microsoft Clarity</b> — бесплатные тепловые карты и запись сессий.</div>
+          <div><b>Уведомления в Telegram</b> — когда клиент открыл страницу.</div>
+          <div><b>Время на странице</b> — уже считается (last_seen каждые 30 сек).</div>
+          <div><b>График активности</b> — посещения по дням можно добавить следующим шагом.</div>
         </div>
       </div>
     </div>
