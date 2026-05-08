@@ -168,13 +168,15 @@ export default function App() {
       ip: geoRef.current?.query || null,
       created_at: new Date().toISOString(),
     };
-    // Сохраняем в Supabase
-    supabase.from("logs").insert(entry).catch(() => {});
-    // Сохраняем в state + localStorage сразу
+    // Сохраняем в state + localStorage сразу (не ждём Supabase)
     setLogs(prev => {
       const updated = [entry, ...prev].slice(0, 500);
       try { localStorage.setItem(`cp:logs:${CLIENT_ID}`, JSON.stringify(updated)); } catch {}
       return updated;
+    });
+    // Пытаемся сохранить в Supabase (не блокирует UI)
+    supabase.from("logs").insert(entry).then(({ error }) => {
+      if (error) console.warn("Лог не сохранён в Supabase:", error.message);
     });
   }, []);
   const presenceChannelRef = useRef(null);
@@ -331,7 +333,8 @@ export default function App() {
         ip: geoData?.query || null, country: geoData?.country || null, city: geoData?.city || null,
         last_seen: new Date().toISOString(),
       };
-      await supabase.from("visits").upsert(entry, { onConflict: "session_id" }).catch(() => {});
+      const { error } = await supabase.from("visits").upsert(entry, { onConflict: "session_id" });
+      if (error) console.warn("Визит не сохранён в Supabase:", error.message);
       // Обновляем локальный кэш
       setVisits(prev => {
         const exists = prev.find(v => v.session_id === SESSION_ID);
@@ -428,11 +431,11 @@ export default function App() {
     const nt = { id: mkId(), name: "", status: "new", result: "", planTime: "", notBillable: false, createdAt: new Date().toISOString(), sessions: [] };
     setTasks(prev => { const n = [...prev]; n.splice((afterIdx ?? n.length) + 1, 0, nt); return n; });
     logAction("added", "task", "Новая задача");
-    setTimeout(() => {
-      const rows = document.querySelectorAll("[data-task-row]");
-      const last = rows[rows.length - 1];
-      if (last) { const inp = last.querySelector("input:not([type=checkbox])"); inp?.focus(); }
-    }, 30);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const taskRows = document.querySelectorAll("[data-task-row]");
+      const last = taskRows[taskRows.length - 1];
+      if (last) { const inp = last.querySelector("input:not([type=checkbox])"); inp?.focus(); inp?.select(); }
+    }));
   };
   const updTask = (id, f, v) => setTasks(prev => prev.map(t => t.id === id ? { ...t, [f]: v } : t));
   const rmTask  = (id) => {
@@ -448,11 +451,11 @@ export default function App() {
   const addRow = (ai) => {
     setRows(prev => { const n = [...prev]; n.splice(ai + 1, 0, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: false }); return n; });
     logAction("added", "time_row", "Новая строка времени");
-    setTimeout(() => {
-      const rows = document.querySelectorAll("[data-time-row]");
-      const last = rows[rows.length - 1];
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const timeRows = document.querySelectorAll("[data-time-row]");
+      const last = timeRows[timeRows.length - 1];
       if (last) { const inp = last.querySelector("input"); inp?.focus(); }
-    }, 30);
+    }));
   };
   const addDivider = () => { setRows(r => [...r, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: true, label: "" }]); logAction("added", "time_row", "Закрытие фронта работы"); };
   const updRow     = (id, f, v) => setRows(r => r.map(x => x.id === id ? { ...x, [f]: v } : x));
@@ -1323,7 +1326,10 @@ const ACTION_CFG = {
 function groupByDate(items, dateField) {
   const groups = {};
   items.forEach(item => {
-    const d = new Date(item[dateField]);
+    const raw = item[dateField];
+    if (!raw) return; // пропускаем пустые даты
+    const d = new Date(raw);
+    if (isNaN(d.getTime())) return; // пропускаем невалидные даты
     const key = d.toDateString();
     if (!groups[key]) groups[key] = { date: d, label: formatGroupLabel(d), items: [] };
     groups[key].items.push(item);
