@@ -161,18 +161,21 @@ export default function App() {
   useEffect(() => { geoRef.current = geoData; }, [geoData]);
 
   const logAction = useCallback((action, entity, entityName) => {
-    supabase.from("logs").insert({
-      client_id: CLIENT_ID, session_id: SESSION_ID,
+    const entry = {
+      id: mkId(), client_id: CLIENT_ID, session_id: SESSION_ID,
       action, entity, entity_name: entityName,
       browser: MY_BROWSER, os: MY_OS,
       ip: geoRef.current?.query || null,
-    });
-    setLogs(prev => [{
-      id: mkId(), action, entity, entity_name: entityName,
-      browser: MY_BROWSER, os: MY_OS,
-      ip: geoRef.current?.query || null,
       created_at: new Date().toISOString(),
-    }, ...prev]);
+    };
+    // Сохраняем в Supabase
+    supabase.from("logs").insert(entry).catch(() => {});
+    // Сохраняем в state + localStorage сразу
+    setLogs(prev => {
+      const updated = [entry, ...prev].slice(0, 500);
+      try { localStorage.setItem(`cp:logs:${CLIENT_ID}`, JSON.stringify(updated)); } catch {}
+      return updated;
+    });
   }, []);
   const presenceChannelRef = useRef(null);
   const initialLoadDone    = useRef(false);
@@ -293,12 +296,27 @@ export default function App() {
   /* ── Загружаем логи ── */
   useEffect(() => {
     if (!loaded) return;
+    // Из localStorage сразу
+    try {
+      const cached = JSON.parse(localStorage.getItem(`cp:logs:${CLIENT_ID}`) || "[]");
+      if (cached.length) setLogs(cached);
+    } catch {}
+
     supabase.from("logs").select("*").eq("client_id", CLIENT_ID)
       .order("created_at", { ascending: false }).limit(500)
-      .then(({ data }) => { if (data?.length) setLogs(data); });
+      .then(({ data }) => {
+        if (data?.length) {
+          setLogs(data);
+          try { localStorage.setItem(`cp:logs:${CLIENT_ID}`, JSON.stringify(data)); } catch {}
+        }
+      });
     const ch = supabase.channel(`logs:${CLIENT_ID}`)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "logs", filter: `client_id=eq.${CLIENT_ID}` },
-        (payload) => setLogs(prev => [payload.new, ...prev].slice(0, 500)))
+        (payload) => setLogs(prev => {
+          const updated = [payload.new, ...prev].slice(0, 500);
+          try { localStorage.setItem(`cp:logs:${CLIENT_ID}`, JSON.stringify(updated)); } catch {}
+          return updated;
+        }))
       .subscribe();
     return () => supabase.removeChannel(ch);
   }, [loaded]);
@@ -306,12 +324,24 @@ export default function App() {
   /* ── Логируем визит ── */
   useEffect(() => {
     if (!loaded) return;
-    const logVisit = () => supabase.from("visits").upsert({
-      session_id: SESSION_ID, client_id: CLIENT_ID,
-      browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE,
-      ip: geoData?.query || null, country: geoData?.country || null, city: geoData?.city || null,
-      last_seen: new Date().toISOString(),
-    }, { onConflict: "session_id" });
+    const logVisit = async () => {
+      const entry = {
+        session_id: SESSION_ID, client_id: CLIENT_ID,
+        browser: MY_BROWSER, os: MY_OS, device: MY_DEVICE,
+        ip: geoData?.query || null, country: geoData?.country || null, city: geoData?.city || null,
+        last_seen: new Date().toISOString(),
+      };
+      await supabase.from("visits").upsert(entry, { onConflict: "session_id" }).catch(() => {});
+      // Обновляем локальный кэш
+      setVisits(prev => {
+        const exists = prev.find(v => v.session_id === SESSION_ID);
+        const updated = exists
+          ? prev.map(v => v.session_id === SESSION_ID ? { ...v, ...entry } : v)
+          : [{ id: mkId(), visited_at: new Date().toISOString(), ...entry }, ...prev];
+        try { localStorage.setItem(`cp:visits:${CLIENT_ID}`, JSON.stringify(updated)); } catch {}
+        return updated;
+      });
+    };
     logVisit();
     const iv = setInterval(logVisit, 30000);
     return () => clearInterval(iv);
@@ -320,14 +350,24 @@ export default function App() {
   /* ── Загружаем историю визитов ── */
   useEffect(() => {
     if (!loaded) return;
+    // Из localStorage сразу
+    try {
+      const cached = JSON.parse(localStorage.getItem(`cp:visits:${CLIENT_ID}`) || "[]");
+      if (cached.length) setVisits(cached);
+    } catch {}
+
     const fetchVisits = () =>
       supabase.from("visits").select("*").eq("client_id", CLIENT_ID)
         .order("last_seen", { ascending: false }).limit(200)
-        .then(({ data }) => { if (data?.length) setVisits(data); });
+        .then(({ data }) => {
+          if (data?.length) {
+            setVisits(data);
+            try { localStorage.setItem(`cp:visits:${CLIENT_ID}`, JSON.stringify(data)); } catch {}
+          }
+        });
     fetchVisits();
     const ch = supabase.channel(`visits:${CLIENT_ID}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "visits", filter: `client_id=eq.${CLIENT_ID}` },
-        fetchVisits)
+      .on("postgres_changes", { event: "*", schema: "public", table: "visits", filter: `client_id=eq.${CLIENT_ID}` }, fetchVisits)
       .subscribe();
     return () => supabase.removeChannel(ch);
   }, [loaded]);
@@ -397,7 +437,9 @@ export default function App() {
   const updTask = (id, f, v) => setTasks(prev => prev.map(t => t.id === id ? { ...t, [f]: v } : t));
   const rmTask  = (id) => {
     const task = tasks.find(t => t.id === id);
-    logAction("deleted", "task", task?.name || "—");
+    const statusLabel = { new: "Начато", in_progress: "В работе", done: "Выполнено" }[task?.status] || "";
+    const desc = [task?.name, statusLabel, task?.planTime ? `план ${task.planTime}ч` : ""].filter(Boolean).join(" · ") || "—";
+    logAction("deleted", "task", desc);
     if (activeTimerRef.current?.taskId === id) stopTimerRef.current();
     setTasks(prev => prev.filter(t => t.id !== id));
   };
@@ -414,17 +456,36 @@ export default function App() {
   };
   const addDivider = () => { setRows(r => [...r, { id: mkId(), date: "", timeStart: "", timeEnd: "", result: "", isDivider: true, label: "" }]); logAction("added", "time_row", "Закрытие фронта работы"); };
   const updRow     = (id, f, v) => setRows(r => r.map(x => x.id === id ? { ...x, [f]: v } : x));
-  const rmRow      = (id) => { const row = rows.find(r => r.id === id); logAction("deleted", "time_row", row?.result || row?.date || "—"); setRows(r => r.filter(x => x.id !== id)); };
+  const rmRow = (id) => {
+    const row = rows.find(r => r.id === id);
+    const desc = row?.isDivider
+      ? `Закрытие фронта: ${row?.date || "—"} ${row?.label || ""}`.trim()
+      : [row?.date, combineRange(row?.timeStart, row?.timeEnd), row?.result].filter(Boolean).join(" · ") || "—";
+    logAction("deleted", "time_row", desc);
+    setRows(r => r.filter(x => x.id !== id));
+  };
 
   /* ── Payments CRUD ── */
   const addPayment = (ai) => { setPayments(prev => { const n = [...prev]; n.splice((ai ?? n.length - 1) + 1, 0, { id: mkId(), date: "", hours: "", pricePerHour: "" }); return n; }); logAction("added", "payment", "Новая оплата"); };
   const updPay     = (id, f, v) => setPayments(p => p.map(x => x.id === id ? { ...x, [f]: v } : x));
-  const rmPay      = (id) => { const p = payments.find(x => x.id === id); logAction("deleted", "payment", p?.date || "—"); setPayments(p => p.filter(x => x.id !== id)); };
+  const rmPay = (id) => {
+    const p = payments.find(x => x.id === id);
+    const sum = (parseFloat(p?.hours) || 0) * (parseFloat(p?.pricePerHour) || 0);
+    const desc = [p?.date, p?.hours ? `${p.hours}ч` : "", sum > 0 ? `${Math.round(sum)} ₴` : ""].filter(Boolean).join(" · ") || "—";
+    logAction("deleted", "payment", desc);
+    setPayments(p => p.filter(x => x.id !== id));
+  };
 
+  const rmKb = (id) => {
+    const k = knowledge.find(x => x.id === id);
+    const desc = [k?.name, k?.url].filter(Boolean).join(" · ") || "—";
+    logAction("deleted", "kb", desc);
+    setKnowledge(k => k.filter(x => x.id !== id));
+  };
   /* ── KB CRUD ── */
   const addKb = (ai) => { setKnowledge(prev => { const n = [...prev]; n.splice((ai ?? n.length - 1) + 1, 0, { id: mkId(), name: "", url: "" }); return n; }); logAction("added", "kb", "Новая запись"); };
   const updKb = (id, f, v) => setKnowledge(k => k.map(x => x.id === id ? { ...x, [f]: v } : x));
-  const rmKb  = (id) => { const k = knowledge.find(x => x.id === id); logAction("deleted", "kb", k?.name || "—"); setKnowledge(k => k.filter(x => x.id !== id)); };
+  
 
   /* ── Summaries ── */
   const totalWorkMin   = rows.filter(r => !r.isDivider).reduce((s, r) => s + (parseTimeRange(combineRange(r.timeStart, r.timeEnd)) || 0), 0);
@@ -1259,12 +1320,40 @@ const ACTION_CFG = {
   updated: { label: "Изменил",  color: "#D97706", bg: "rgba(217,119,6,.1)"  },
 };
 
+function groupByDate(items, dateField) {
+  const groups = {};
+  items.forEach(item => {
+    const d = new Date(item[dateField]);
+    const key = d.toDateString();
+    if (!groups[key]) groups[key] = { date: d, label: formatGroupLabel(d), items: [] };
+    groups[key].items.push(item);
+  });
+  return Object.values(groups).sort((a, b) => b.date - a.date);
+}
+
+function formatGroupLabel(date) {
+  const now = new Date(); now.setHours(0,0,0,0);
+  const d = new Date(date); d.setHours(0,0,0,0);
+  const diff = Math.round((now - d) / 86400000);
+  if (diff === 0) return "Сегодня";
+  if (diff === 1) return "Вчера";
+  return date.toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+}
+
+function isRecent(date) {
+  return (Date.now() - new Date(date).getTime()) < 2 * 24 * 60 * 60 * 1000;
+}
+
 function VisitsTab({ visits, logs }) {
-  const [activeSection, setActiveSection] = useState("visits"); // visits | logs
+  const [activeSection, setActiveSection] = useState("visits");
+  const [logFilter,     setLogFilter]     = useState("all");
+  const [collapsed,     setCollapsed]     = useState(new Set()); // keys of collapsed groups
   const now = Date.now();
-  const unique   = new Set(visits.map(v => v.ip || v.session_id)).size;
+
+  const unique    = new Set(visits.map(v => v.ip || v.session_id)).size;
   const activeNow = visits.filter(v => v.last_seen && now - new Date(v.last_seen).getTime() < 2 * 60 * 1000).length;
 
+  const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : "—";
   const fmtDiff = (iso) => {
     if (!iso) return "—";
     const diff = Math.floor((now - new Date(iso).getTime()) / 60000);
@@ -1274,15 +1363,28 @@ function VisitsTab({ visits, logs }) {
     return `${Math.floor(diff / 1440)} дн назад`;
   };
 
+  const toggleGroup = (key) => setCollapsed(prev => {
+    const n = new Set(prev);
+    n.has(key) ? n.delete(key) : n.add(key);
+    return n;
+  });
+
+  // Filtered logs
+  const filteredLogs = logFilter === "all" ? logs : logs.filter(l => l.action === logFilter);
+
+  // Grouped
+  const visitGroups = groupByDate(visits, "last_seen");
+  const logGroups   = groupByDate(filteredLogs, "created_at");
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       {/* Summary cards */}
       <div style={{ display: "flex", gap: 12 }}>
         {[
-          { label: "Всего сессий",    value: visits.length,  color: C.dark,     icon: "📋" },
-          { label: "Уникальных (IP)", value: unique,          color: C.blue,     icon: "👤" },
-          { label: "Онлайн сейчас",   value: activeNow,       color: "#4ADE80",  icon: "🟢" },
-          { label: "Действий в логе", value: logs.length,     color: C.gold,     icon: "📝" },
+          { label: "Всего сессий",    value: visits.length, color: C.dark,    icon: "📋" },
+          { label: "Уникальных (IP)", value: unique,         color: C.blue,    icon: "👤" },
+          { label: "Онлайн сейчас",   value: activeNow,      color: "#4ADE80", icon: "🟢" },
+          { label: "Действий в логе", value: logs.length,    color: C.gold,    icon: "📝" },
         ].map(({ label, value, color, icon }) => (
           <div key={label} style={{ ...cardS, flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
             <div style={{ fontSize: 18 }}>{icon}</div>
@@ -1293,127 +1395,168 @@ function VisitsTab({ visits, logs }) {
       </div>
 
       {/* Section toggle */}
-      <div style={{ display: "flex", background: "#F2EFE9", borderRadius: 9, padding: 3, gap: 1, border: `1px solid ${C.border}`, alignSelf: "flex-start" }}>
-        {[["visits", "👁 Посещения"], ["logs", "📝 Лог действий"]].map(([k, l]) => (
-          <button key={k} onClick={() => setActiveSection(k)}
-            style={{ padding: "6px 18px", borderRadius: 7, border: "none", background: activeSection === k ? C.card : "none", color: activeSection === k ? C.dark : C.muted, fontWeight: activeSection === k ? 700 : 400, fontSize: 13, cursor: "pointer", fontFamily: "inherit", boxShadow: activeSection === k ? "0 1px 4px rgba(0,0,0,.1)" : "none" }}>
-            {l}
-          </button>
-        ))}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", background: "#F2EFE9", borderRadius: 9, padding: 3, gap: 1, border: `1px solid ${C.border}` }}>
+          {[["visits", "👁 Посещения"], ["logs", "📝 Лог действий"]].map(([k, l]) => (
+            <button key={k} onClick={() => setActiveSection(k)}
+              style={{ padding: "6px 18px", borderRadius: 7, border: "none", background: activeSection === k ? C.card : "none", color: activeSection === k ? C.dark : C.muted, fontWeight: activeSection === k ? 700 : 400, fontSize: 13, cursor: "pointer", fontFamily: "inherit", boxShadow: activeSection === k ? "0 1px 4px rgba(0,0,0,.1)" : "none" }}>
+              {l}
+            </button>
+          ))}
+        </div>
+
+        {/* Log filter — only shown in logs section */}
+        {activeSection === "logs" && (
+          <div style={{ display: "flex", gap: 6 }}>
+            {[["all","Все"], ["added","Добавил"], ["deleted","Удалил"], ["updated","Изменил"]].map(([k, l]) => (
+              <button key={k} onClick={() => setLogFilter(k)}
+                style={{ padding: "5px 14px", borderRadius: 20, border: `1px solid ${logFilter === k ? C.gold : C.border}`, background: logFilter === k ? C.goldLight : "none", color: logFilter === k ? "#8B5E10" : C.muted, fontSize: 12, fontWeight: logFilter === k ? 700 : 400, cursor: "pointer", fontFamily: "inherit" }}>
+                {l}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Visits table */}
+      {/* VISITS grouped */}
       {activeSection === "visits" && (
-        <div style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, boxShadow: "0 1px 4px rgba(0,0,0,.07)", overflow: "hidden" }}>
-          <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, fontWeight: 700, fontSize: 15, color: C.dark }}>
-            👁 История посещений
-          </div>
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 700 }}>
-              <thead><tr>
-                <th style={thS}>СТАТУС</th>
-                <th style={thS}>БРАУЗЕР / ОС</th>
-                <th style={thS}>УСТРОЙСТВО</th>
-                <th style={thS}>ГОРОД / СТРАНА</th>
-                <th style={thS}>IP</th>
-                <th style={thS}>ПЕРВЫЙ ВИЗИТ</th>
-                <th style={thS}>БЫЛ ОНЛАЙН</th>
-              </tr></thead>
-              <tbody>
-                {visits.length === 0 && (
-                  <tr><td colSpan={7} style={{ ...tdS, textAlign: "center", color: C.muted, padding: "32px 0" }}>Нет данных о посещениях</td></tr>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {visitGroups.length === 0 && (
+            <div style={{ ...cardS, textAlign: "center", color: C.muted, padding: "32px 0" }}>Нет данных о посещениях</div>
+          )}
+          {visitGroups.map(({ label, date, items }) => {
+            const key = date.toDateString();
+            const recent = isRecent(date);
+            const open = !collapsed.has(key) && recent || collapsed.has(key) && !recent
+              ? recent // default: recent=open, old=closed
+              : collapsed.has(key) ? false : recent;
+            const isOpen = recent ? !collapsed.has(key) : collapsed.has(key);
+
+            return (
+              <div key={key} style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+                <button onClick={() => toggleGroup(key)}
+                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "10px 16px", background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", borderBottom: isOpen ? `1px solid ${C.border}` : "none" }}>
+                  <span style={{ fontSize: 12, color: C.muted }}>{isOpen ? "▾" : "▶"}</span>
+                  <span style={{ fontWeight: 700, fontSize: 14, color: C.dark }}>{label}</span>
+                  <span style={{ fontSize: 11, color: C.muted, marginLeft: 4 }}>{items.length} сессий</span>
+                </button>
+                {isOpen && (
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead><tr>
+                      <th style={thS}>СТАТУС</th>
+                      <th style={thS}>БРАУЗЕР / ОС</th>
+                      <th style={thS}>УСТРОЙСТВО</th>
+                      <th style={thS}>ГОРОД / СТРАНА</th>
+                      <th style={thS}>IP</th>
+                      <th style={thS}>ПЕРВЫЙ ВИЗИТ</th>
+                      <th style={thS}>БЫЛ ОНЛАЙН</th>
+                    </tr></thead>
+                    <tbody>
+                      {items.map(v => {
+                        const isActive = v.last_seen && now - new Date(v.last_seen).getTime() < 2 * 60 * 1000;
+                        return (
+                          <tr key={v.id}
+                            onMouseEnter={e => e.currentTarget.style.background = "#FDFCFB"}
+                            onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+                            <td style={{ ...tdS, textAlign: "center" }}>
+                              {isActive
+                                ? <span style={{ display: "inline-flex", alignItems: "center", gap: 5, background: "rgba(74,222,128,.12)", color: "#16A34A", borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
+                                    <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ADE80", animation: "blink 1.2s infinite" }} />онлайн
+                                  </span>
+                                : <span style={{ fontSize: 11, color: C.muted }}>оффлайн</span>}
+                            </td>
+                            <td style={{ ...tdS, fontSize: 12 }}>
+                              <div style={{ fontWeight: 600 }}>{v.browser || "—"}</div>
+                              <div style={{ color: C.muted, fontSize: 11 }}>{v.os || "—"}</div>
+                            </td>
+                            <td style={{ ...tdS, fontSize: 12 }}>{v.device || "🖥 Компьютер"}</td>
+                            <td style={{ ...tdS, fontSize: 12 }}>{[v.city, v.country].filter(Boolean).join(", ") || "—"}</td>
+                            <td style={{ ...tdS, fontSize: 11, fontFamily: "monospace" }}>{v.ip || "—"}</td>
+                            <td style={{ ...tdS, fontSize: 11, color: C.muted }}>
+                              {v.visited_at ? new Date(v.visited_at).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}
+                            </td>
+                            <td style={{ ...tdS, fontSize: 11, color: C.muted }}>{fmtDiff(v.last_seen)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 )}
-                {visits.map((v) => {
-                  const isActive = v.last_seen && now - new Date(v.last_seen).getTime() < 2 * 60 * 1000;
-                  return (
-                    <tr key={v.id}
-                      onMouseEnter={e => e.currentTarget.style.background = "#FDFCFB"}
-                      onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
-                      <td style={{ ...tdS, textAlign: "center" }}>
-                        {isActive
-                          ? <span style={{ display: "inline-flex", alignItems: "center", gap: 5, background: "rgba(74,222,128,.12)", color: "#16A34A", borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
-                              <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ADE80", animation: "blink 1.2s infinite" }} />онлайн
-                            </span>
-                          : <span style={{ fontSize: 11, color: C.muted }}>оффлайн</span>}
-                      </td>
-                      <td style={{ ...tdS, fontSize: 12 }}>
-                        <div style={{ fontWeight: 600 }}>{v.browser || "—"}</div>
-                        <div style={{ color: C.muted, fontSize: 11 }}>{v.os || "—"}</div>
-                      </td>
-                      <td style={{ ...tdS, fontSize: 12 }}>{v.device || "🖥 Компьютер"}</td>
-                      <td style={{ ...tdS, fontSize: 12 }}>{[v.city, v.country].filter(Boolean).join(", ") || <span style={{ color: C.muted }}>—</span>}</td>
-                      <td style={{ ...tdS, fontSize: 12, fontFamily: "monospace" }}>{v.ip || "—"}</td>
-                      <td style={{ ...tdS, fontSize: 11, color: C.muted }}>
-                        {v.visited_at ? new Date(v.visited_at).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}
-                      </td>
-                      <td style={{ ...tdS, fontSize: 11, color: C.muted }}>{fmtDiff(v.last_seen)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
-      {/* Logs table */}
+      {/* LOGS grouped */}
       {activeSection === "logs" && (
-        <div style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, boxShadow: "0 1px 4px rgba(0,0,0,.07)", overflow: "hidden" }}>
-          <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, fontWeight: 700, fontSize: 15, color: C.dark }}>
-            📝 Лог действий
-          </div>
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 600 }}>
-              <thead><tr>
-                <th style={thS}>ВРЕМЯ</th>
-                <th style={thS}>ДЕЙСТВИЕ</th>
-                <th style={thS}>РАЗДЕЛ</th>
-                <th style={thS}>ЧТО</th>
-                <th style={thS}>БРАУЗЕР / ОС</th>
-                <th style={thS}>IP</th>
-              </tr></thead>
-              <tbody>
-                {logs.length === 0 && (
-                  <tr><td colSpan={6} style={{ ...tdS, textAlign: "center", color: C.muted, padding: "32px 0" }}>Действий пока нет</td></tr>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {logGroups.length === 0 && (
+            <div style={{ ...cardS, textAlign: "center", color: C.muted, padding: "32px 0" }}>
+              {logFilter === "all" ? "Действий пока нет" : `Нет действий типа «${ACTION_CFG[logFilter]?.label || logFilter}»`}
+            </div>
+          )}
+          {logGroups.map(({ label, date, items }) => {
+            const key = "log:" + date.toDateString();
+            const recent = isRecent(date);
+            const isOpen = recent ? !collapsed.has(key) : collapsed.has(key);
+
+            return (
+              <div key={key} style={{ background: C.card, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+                <button onClick={() => toggleGroup(key)}
+                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "10px 16px", background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", borderBottom: isOpen ? `1px solid ${C.border}` : "none" }}>
+                  <span style={{ fontSize: 12, color: C.muted }}>{isOpen ? "▾" : "▶"}</span>
+                  <span style={{ fontWeight: 700, fontSize: 14, color: C.dark }}>{label}</span>
+                  <span style={{ fontSize: 11, color: C.muted, marginLeft: 4 }}>{items.length} действий</span>
+                </button>
+                {isOpen && (
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead><tr>
+                      <th style={thS}>ВРЕМЯ</th>
+                      <th style={thS}>ДЕЙСТВИЕ</th>
+                      <th style={thS}>РАЗДЕЛ</th>
+                      <th style={thS}>ЧТО</th>
+                      <th style={thS}>БРАУЗЕР / ОС</th>
+                      <th style={thS}>IP</th>
+                    </tr></thead>
+                    <tbody>
+                      {items.map(l => {
+                        const ac = ACTION_CFG[l.action] || ACTION_CFG.updated;
+                        return (
+                          <tr key={l.id}
+                            onMouseEnter={e => e.currentTarget.style.background = "#FDFCFB"}
+                            onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+                            <td style={{ ...tdS, fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>{fmtTime(l.created_at)}</td>
+                            <td style={tdS}>
+                              <span style={{ background: ac.bg, color: ac.color, borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>{ac.label}</span>
+                            </td>
+                            <td style={{ ...tdS, fontSize: 12, color: C.muted }}>{ENTITY_LABELS[l.entity] || l.entity || "—"}</td>
+                            <td style={{ ...tdS, fontSize: 13, fontWeight: 500 }}>{l.entity_name || "—"}</td>
+                            <td style={{ ...tdS, fontSize: 11, color: C.muted }}>
+                              <div>{l.browser || "—"}</div>
+                              <div style={{ fontSize: 10 }}>{l.os || "—"}</div>
+                            </td>
+                            <td style={{ ...tdS, fontSize: 11, fontFamily: "monospace", color: C.muted }}>{l.ip || "—"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 )}
-                {logs.map((l) => {
-                  const ac = ACTION_CFG[l.action] || ACTION_CFG.updated;
-                  return (
-                    <tr key={l.id}
-                      onMouseEnter={e => e.currentTarget.style.background = "#FDFCFB"}
-                      onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
-                      <td style={{ ...tdS, fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>
-                        {l.created_at ? new Date(l.created_at).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}
-                      </td>
-                      <td style={{ ...tdS }}>
-                        <span style={{ background: ac.bg, color: ac.color, borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
-                          {ac.label}
-                        </span>
-                      </td>
-                      <td style={{ ...tdS, fontSize: 12, color: C.muted }}>{ENTITY_LABELS[l.entity] || l.entity || "—"}</td>
-                      <td style={{ ...tdS, fontSize: 13, fontWeight: 500 }}>{l.entity_name || "—"}</td>
-                      <td style={{ ...tdS, fontSize: 11, color: C.muted }}>
-                        <div>{l.browser || "—"}</div>
-                        <div style={{ fontSize: 10 }}>{l.os || "—"}</div>
-                      </td>
-                      <td style={{ ...tdS, fontSize: 11, fontFamily: "monospace", color: C.muted }}>{l.ip || "—"}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
-      {/* Recommendation block */}
+      {/* Tip block */}
       <div style={{ ...cardS, background: C.goldLight, border: `1px solid rgba(200,146,42,.3)` }}>
-        <div style={{ fontWeight: 700, fontSize: 14, color: "#8B5E10", marginBottom: 8 }}>💡 Также рекомендуем подключить</div>
+        <div style={{ fontWeight: 700, fontSize: 14, color: "#8B5E10", marginBottom: 8 }}>💡 Также рекомендуем</div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 13, color: C.text }}>
           <div><b>Microsoft Clarity</b> — бесплатные тепловые карты и запись сессий.</div>
           <div><b>Уведомления в Telegram</b> — когда клиент открыл страницу.</div>
           <div><b>Время на странице</b> — уже считается (last_seen каждые 30 сек).</div>
-          <div><b>График активности</b> — посещения по дням можно добавить следующим шагом.</div>
+          <div><b>График активности</b> — посещения по дням.</div>
         </div>
       </div>
     </div>
